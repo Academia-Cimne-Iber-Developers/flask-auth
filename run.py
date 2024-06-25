@@ -57,6 +57,7 @@ def verify_authentication():
 
 
 # Ruta para obtener el usuario autenticado
+@app.route("/login", methods=["POST"])
 @app.route("/me", methods=["GET"])
 def me_route():
     try:
