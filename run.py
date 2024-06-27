@@ -1,172 +1,175 @@
-from flask import Flask, request, jsonify, make_response
-from flask_cors import CORS
-
+from flask import Flask, session, jsonify, url_for, make_response, request
 from cryptography.fernet import Fernet
+
 import secrets
-import hashlib
+
+from flask_cors import CORS
+from authlib.integrations.flask_client import OAuth
 from datetime import datetime, timedelta
 
+from decouple import config
+
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+CORS(app, supports_credentials=True, origins=["http://localhost:5173"])
 
-# Clave secreta para encriptar el identificador de sesión
-SECRET_KEY = b"GPimJlIp7j1p-dsu9xvF2jhU8lL6cvzovhNH2CMRtmI="
+app.secret_key = Fernet.generate_key()
+fernet = Fernet(app.secret_key)
 
-# Base de datos de usuarios
-users = []
+oauth = OAuth(app)
+google = oauth.register(
+    name="google",
+    client_id=config("CLIENT_ID"),
+    client_secret=config("CLIENT_SECRET"),
+    access_token_url="https://accounts.google.com/o/oauth2/token",
+    access_token_params=None,
+    authorize_url="https://accounts.google.com/o/oauth2/auth",
+    authorize_params=None,
+    api_base_url="https://www.googleapis.com/oauth2/v1/",
+    client_kwargs={"scope": "email profile"},
+)
 
-# Base de datos de sesiones
-sessions = {}
+users = {}
+
+# Base de datos de tokens de pre-autenticación
+temp_storage = {}
+
+# Función para almacenar un token de pre-autenticación
+def store_pre_auth_token(token, session_data):
+    temp_storage[token] = session_data
 
 
-# Función para generar un hash de una cadena
-def hash_string(string):
-    return hashlib.sha256(string.encode()).hexdigest()
-
+# Función para recuperar un token de pre-autenticación
+def retrieve_session(token):
+    session_data = temp_storage.pop(token, None)
+    return session_data
 
 # Función para generar un identificador de sesión
 def generate_session_id():
     return secrets.token_hex(16)
 
-
 # Función para encriptar un valor
 def encrypt_value(value):
-    f = Fernet(SECRET_KEY)
-    return f.encrypt(value.encode()).decode()
-
+    return fernet.encrypt(value.encode()).decode()
 
 # Función para desencriptar un valor
 def decrypt_value(value):
-    f = Fernet(SECRET_KEY)
-    return f.decrypt(value.encode()).decode()
-
-
-# Función para verificar que el usuario exista en la base de datos
-def verify_user(username, password):
-    for user in users:
-        if user["username"] == username and user["password"] == hash_string(password):
-            return user
-    return None
-
-
-# Función para verificar que el identificador de sesión sea válido
-def verify_session(session_id):
-    return session_id in sessions
+    return fernet.decrypt(value.encode()).decode()
 
 
 # Función para obtener el usuario a partir del identificador de sesión
-def get_user(session_id):
-    return sessions[session_id]
+def get_user(pre_auth_token):
+    return temp_storage[pre_auth_token]
 
 
-# Función para crear un usuario
-def create_user(username, email, password):
-    user = {
-        "id": len(users) + 1,
-        "username": username,
-        "email": email,
-        "password": hash_string(password),
-    }
-    users.append(user)
-    return user
-
-
-# Función para crear una sesión
-def create_session(user):
-    session_id = generate_session_id()
-    sessions[session_id] = user
-    return session_id
-
-
-# Función para eliminar una sesión
-def delete_session(session_id):
-    del sessions[session_id]
-
+def create_session(user, pre_auth_token=None):
+    session[pre_auth_token] = user
+    return pre_auth_token
 
 # Función para obtener el identificador de sesión de una cookie
 def get_session_id_from_cookie():
     session_id = request.cookies.get("session_id")
     if session_id:
-        return decrypt_value(session_id)
+        return session_id
     return None
 
-
-# Función para crear una cookie con el identificador de sesión
 def create_session_cookie(session_id):
-    session_id_encrypted = encrypt_value(session_id)
+    session_id_encrypted = session_id
     response = make_response(jsonify({"message": "Sesión iniciada"}))
-    # Set the cookie with SameSite=None and Secure
+
     response.set_cookie(
-        "session_id",
-        session_id_encrypted,
-        httponly=True,  # Optional, but recommended for security
-        secure=True,  # Required for SameSite=None
-        samesite="None",  # Setting SameSite to None
+        key="session_id",
+        value=session_id_encrypted,
+        httponly=True,
+        secure=True,
+        samesite="None",
         expires=datetime.now() + timedelta(days=1),
-    )  # Optional: Set cookie expiry
+        domain="localhost:5173",
+    )
+
     return response
 
-
-# Función para eliminar la cookie con el identificador de sesión
 def delete_session_cookie():
     response = make_response(jsonify({"message": "Sesión cerrada"}))
     response.set_cookie("session_id", "", expires=0)
     return response
 
+@app.route("/signup")
+def register_user():
+    redirect_uri = url_for("authorize_user", _external=True)
+    return google.authorize_redirect(redirect_uri)
 
-# Función para verificar que el usuario esté autenticado
-def verify_authentication():
-    session_id = get_session_id_from_cookie()
-    if session_id and verify_session(session_id):
-        return True
-    return False
+@app.route("/signup/authorize")
+def authorize_user():
+    token = google.authorize_access_token()
+    user_info = google.get("userinfo").json()
+    user_id = user_info.get("id")
 
+    if user_id not in users:
+        users[user_id] = {
+            "id": user_id,
+            "username": user_info["name"],
+            "email": user_info["email"],
+            "picture": user_info["picture"],
+        }
+        return jsonify({"message": "Usuario creado con éxito"}), 201
+    else:
+        return jsonify({"message": "El usuario ya existe"}), 400
 
-# Función para obtener el usuario autenticado
-def get_authenticated_user():
-    session_id = get_session_id_from_cookie()
-    if session_id and verify_session(session_id):
-        return get_user(session_id)
-    return None
+@app.route("/me")
+def me():
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        auth_token = auth_header.split(" ")[1]
+    else:
+        auth_token = None
 
+    if auth_token:
+        user = get_user(auth_token)
+        return jsonify(user), 200
+    else:
+        return jsonify({"message": "El usuario no ha iniciado sesión"}), 400
 
-# Ruta para crear un usuario
-@app.route("/users", methods=["POST"])
-def create_user_route():
-    data = request.get_json()
-    user = create_user(data["username"], data["email"], data["password"])
-    return jsonify(user)
+# Redireccionamos al servidor de Google (la aplicación de terceros)
+@app.route("/login")
+def login():
+    pre_auth_token = request.args.get("state")
 
+    store_pre_auth_token(pre_auth_token, {"initiated": True})
 
-# Ruta para iniciar sesión
-@app.route("/login", methods=["POST"])
-def login_route():
-    data = request.get_json()
-    user = verify_user(data["username"], data["password"])
-    if user:
-        session_id = create_session(user)
-        return create_session_cookie(session_id)
-    return jsonify({"message": "Usuario o contraseña incorrectos"}), 401
+    redirect_uri = url_for("authorize", _external=True)
+    return google.authorize_redirect(redirect_uri)
 
+# Endpoint de rediccionamiento de Google
+@app.route("/login/authorize")
+def authorize():
+    token = google.authorize_access_token()
+    user_info = google.get("userinfo").json()
+    user_id = user_info.get("id")
 
-# Ruta para cerrar sesión
-@app.route("/logout", methods=["POST"])
-def logout_route():
-    session_id = get_session_id_from_cookie()
-    if session_id:
-        delete_session(session_id)
-        return delete_session_cookie()
-    return jsonify({"message": "No se ha iniciado sesión"}), 401
+    # Revise si el usuario no está registrado
+    if user_id not in users:
+        return jsonify({"message": "Usuario no registrado"}), 400
+    
+    # Almacener información del usuario en la sesión
+    user = users[user_id]
 
+    pre_auth_token = request.args.get("state")
+    session_id = create_session(user, pre_auth_token)
+    temp_storage[pre_auth_token] = session[session_id]
 
-# Ruta para obtener el usuario autenticado
-@app.route("/me", methods=["GET"])
-def me_route():
-    if verify_authentication():
-        user = get_authenticated_user()
-        return jsonify(user)
-    return jsonify({"message": "No se ha iniciado sesión"}), 401
+    # Redireccionar a la URL de origen
+    # from_url = request.args.get("from_url", "http://localhost:5173/")
+
+    response = create_session_cookie(session_id)
+    return response, 200
+
+@app.route("/logout")
+def logout():
+    session.pop("user_id", None)
+    response = make_response(jsonify({"message": "Sesión cerrada"}), 200)
+    response.set_cookie("session_id", "", expires=0)
+    return response
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0")
